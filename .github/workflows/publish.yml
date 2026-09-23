@@ -1,0 +1,118 @@
+name: Publish to npm
+
+# Runs in the standalone `lindoai/lindoai-cli` repo (synced from the monorepo
+# at `packages/sdks/cli/`). On every push to `main`, if `package.json` has a
+# new version, builds + tests + publishes `lindoai-cli` to npm.
+#
+# Auth: uses the org-level `NPM_TOKEN` secret configured under
+# https://github.com/organizations/lindoai/settings/secrets/actions.
+#
+# The CLI depends on `lindoai` (the TypeScript SDK). When both bump together,
+# the `lindoai` package may not be available on npm yet when this workflow
+# runs. The `Wait for lindoai dependency` step polls npm until the required
+# version is visible so `npm ci` resolves cleanly.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed for npm provenance attestations (works alongside a classic
+      # token — OIDC is used only to sign the provenance, not to authenticate
+      # the publish itself).
+      id-token: write
+      # Needed for softprops/action-gh-release to cut a GitHub Release.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Get version
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+      - name: Check if version already published
+        id: check
+        run: |
+          PUBLISHED=$(npm view lindoai-cli version 2>/dev/null || echo "0.0.0")
+          if [ "${{ steps.version.outputs.version }}" = "$PUBLISHED" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      # -----------------------------------------------------------------
+      # Wait for the `lindoai` SDK dep to be available on npm.
+      # When both packages bump in the same monorepo push, this workflow
+      # may run before the `lindoai-js` publish finishes. Poll npm for up
+      # to ~5 minutes until the required version shows up.
+      # -----------------------------------------------------------------
+      - name: Wait for lindoai dependency on npm
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          # Extract the `^x.y.z` constraint from package.json, strip the `^`
+          # and just wait for the exact version (which is what we'd get
+          # anyway unless someone is pinning to an older minor).
+          REQ=$(node -p "require('./package.json').dependencies.lindoai.replace(/^[\^~]/, '')")
+          echo "CLI requires lindoai@${REQ}"
+          for i in {1..30}; do
+            AVAILABLE=$(npm view "lindoai@${REQ}" version 2>/dev/null || echo "")
+            if [ -n "$AVAILABLE" ]; then
+              echo "lindoai@${REQ} is available on npm."
+              exit 0
+            fi
+            echo "lindoai@${REQ} not yet published — waiting 10s (attempt ${i}/30)…"
+            sleep 10
+          done
+          echo "::error::lindoai@${REQ} never became available on npm after 5 minutes."
+          exit 1
+
+      - name: Install dependencies
+        if: steps.check.outputs.skip == 'false'
+        # Using `npm install` (not `npm ci`) so that `lindoai@^X.Y.Z` resolves
+        # freshly against npm. The committed `package-lock.json` goes stale
+        # on every TS SDK bump — `npm install` fixes it up in place.
+        run: npm install --no-audit --no-fund
+
+      # tsup compiles src/ → dist/ (both CJS + ESM + .d.ts, with the node
+      # shebang banner). Required because `dist/` is gitignored and
+      # `files: ["dist"]` in package.json.
+      - name: Build
+        if: steps.check.outputs.skip == 'false'
+        run: npm run build
+
+      - name: Publish to npm
+        if: steps.check.outputs.skip == 'false'
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          body: |
+            ## `lindoai-cli` v${{ steps.version.outputs.version }}
+
+            Install:
+
+            ```bash
+            npm install -g lindoai-cli@${{ steps.version.outputs.version }}
+            ```
+
+            See [the docs](https://lindo.ai) for usage.
+          make_latest: true
+
+      - name: Skip notice
+        if: steps.check.outputs.skip == 'true'
+        run: echo "Version ${{ steps.version.outputs.version }} already published, skipping."
